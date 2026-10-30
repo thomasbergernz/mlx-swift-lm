@@ -177,6 +177,87 @@ struct HarmonyOutputRouterTests {
         #expect(events.compactMap(\.response).joined() == "plan stepsdone")
     }
 
+    @Test("arguments that violate the declared schema are rejected")
+    func schemaViolationRejected() throws {
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "get_weather",
+                    "parameters": [
+                        "type": "object",
+                        "properties": ["city": ["type": "string"]],
+                        "required": ["city"],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let events = try route(
+            [
+                "<|channel|>", "commentary to=functions.get_weather",
+                "<|message|>", #"{"city":3}"#, "<|call|>",
+            ],
+            tools: tools, toolCallPolicy: .init(validation: .strict))
+
+        #expect(events.compactMap(\.toolCall).isEmpty)
+        let rejection = try #require(events.compactMap(\.rejectedToolCall).first)
+        #expect(rejection.reason == .invalidArguments)
+        #expect(rejection.toolName == "get_weather")
+        #expect(rejection.detail == "arguments.city must be a string")
+    }
+
+    @Test("Harmony normalizes arguments before independently applying validation")
+    func normalizationAndValidationPolicy() throws {
+        let parameters: [String: any Sendable] = [
+            "type": "object", "properties": ["count": ["type": "integer"]],
+        ]
+        let tools: [[String: any Sendable]] = [
+            ["function": ["name": "search", "parameters": parameters] as [String: any Sendable]]
+        ]
+        for policy in ToolCallValidationPolicy.allCases {
+            for (text, expected): (String, JSONValue?) in [
+                ("6", .int(6)), ("six", policy == .strict ? nil : .string("six")),
+            ] {
+                let events = try route(
+                    [
+                        "<|channel|>", "commentary to=functions.search", "<|message|>",
+                        "{\"count\":\"\(text)\"}", "<|call|>",
+                    ],
+                    tools: tools,
+                    toolCallPolicy: policy == .strict ? .init(validation: .strict) : .init())
+                #expect(
+                    events.compactMap(\.toolCall).first?.function.arguments["count"] == expected)
+                #expect(events.compactMap(\.rejectedToolCall).count == (expected == nil ? 1 : 0))
+            }
+        }
+    }
+
+    @Test("unsupported schema assertions cannot reject a Harmony call")
+    func unsupportedSchemaAssertionFailsOpen() throws {
+        let tools: [[String: any Sendable]] = [
+            [
+                "function": [
+                    "name": "submit",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "code": ["type": "string", "pattern": "^[0-9]+$"]
+                                as [String: any Sendable]
+                        ],
+                    ] as [String: any Sendable],
+                ] as [String: any Sendable]
+            ]
+        ]
+        let events = try route(
+            [
+                "<|channel|>", "commentary to=functions.submit",
+                "<|message|>", #"{"code":"not-digits"}"#, "<|call|>",
+            ],
+            tools: tools, toolCallPolicy: .init(validation: .strict))
+
+        #expect(events.compactMap(\.toolCall).map(\.function.name) == ["submit"])
+        #expect(events.compactMap(\.rejectedToolCall).isEmpty)
+    }
+
     @Test("stream adapter surfaces and counts Harmony rejections")
     func adapterSurfacesAndCountsRejections() throws {
         let pieces = [
@@ -214,6 +295,55 @@ struct HarmonyOutputRouterTests {
         #expect(rejections.map(\.reason) == [.undeclaredTool, .invalidArguments])
         #expect(adapter.rejectedToolCallCount == 2)
     }
+
+    @Test("markers spelled out in the middle of analysis stay private reasoning")
+    func literalMarkersInsideAnalysis() throws {
+        let thought = "a frame ends with <|end|> and <|channel|>final<|message|> opens the answer"
+        let events = try route(
+            [
+                "<|channel|>", "analysis", "<|message|>", thought, "<|end|>",
+                "<|channel|>", "final", "<|message|>", "public", "<|return|>",
+            ],
+            allowed: ["search"])
+
+        #expect(events.compactMap(\.reasoning).joined() == thought)
+        #expect(events.compactMap(\.response).joined() == "public")
+    }
+
+    @Test("markers spelled out in the middle of the answer stay in the answer")
+    func literalMarkersInsideFinal() throws {
+        let answer = "write <|channel|>analysis<|message|> to start a thought"
+        let events = try route(
+            ["<|channel|>", "final", "<|message|>", answer, "<|return|>"],
+            allowed: ["search"])
+
+        #expect(events.compactMap(\.response).joined() == answer)
+        #expect(events.compactMap(\.reasoning).isEmpty)
+    }
+
+    @Test("analysis that never closes is not shown as the answer")
+    func unclosedAnalysisStaysPrivate() throws {
+        let events = try route(
+            ["<|channel|>", "analysis", "<|message|>", "unfinished"],
+            allowed: ["search"])
+
+        #expect(events.compactMap(\.reasoning).joined() == "unfinished")
+        #expect(events.compactMap(\.response).isEmpty)
+    }
+
+    @Test("a channel opened inside unclosed analysis does not leak the analysis")
+    func channelOpenedInsideUnclosedAnalysis() throws {
+        let events = try route(
+            [
+                "<|channel|>", "analysis", "<|message|>", "first",
+                "<|channel|>", "analysis", "<|message|>", "second",
+                "<|channel|>", "final", "<|message|>", "public", "<|return|>",
+            ],
+            allowed: ["search"])
+
+        #expect(events.compactMap(\.reasoning).joined() == "firstsecond")
+        #expect(events.compactMap(\.response).joined() == "public")
+    }
 }
 
 // MARK: - Helpers
@@ -238,9 +368,23 @@ extension HarmonyOutputRouter.Event {
 }
 
 private func route(_ pieces: [String], allowed: Set<String>) throws -> [HarmonyOutputRouter.Event] {
+    try route(
+        pieces,
+        tools: allowed.map { name in
+            ["function": ["name": name] as [String: any Sendable]]
+        })
+}
+
+private func route(
+    _ pieces: [String], tools: [[String: any Sendable]],
+    toolCallPolicy: ToolCallPolicy = .init()
+) throws
+    -> [HarmonyOutputRouter.Event]
+{
     let tokenizer = RouterDeterministicTokenizer(tokens: pieces + routerControlTokens)
     var parser = try #require(HarmonyFrameParser(tokenizer: tokenizer))
-    var router = HarmonyOutputRouter(tokenizer: tokenizer, allowedToolNames: allowed)
+    var router = HarmonyOutputRouter(
+        tokenizer: tokenizer, tools: tools, toolCallPolicy: toolCallPolicy)
     var events: [HarmonyOutputRouter.Event] = []
     for piece in pieces {
         let id = try #require(tokenizer.convertTokenToId(piece))
